@@ -6,9 +6,9 @@ that pulls from the Georgia DPH inspection portal.
 
 ## Data source & provenance
 
-- Portal: https://ga.healthinspections.us/stateofgeorgia/ (Tyler Technologies DHD
-  system). The Coastal Health District's own site (coastalhealthdistrict.org) just
-  links out to this statewide portal.
+- Portal: https://ga.healthinspections.us/stateofgeorgia/ (the Georgia DPH
+  Environmental Health inspection portal). The Coastal Health District's own site
+  (coastalhealthdistrict.org) just links out to this statewide portal.
 - **Caveat: this is an undocumented, public-record JSON API** reverse-engineered by
   inspecting the portal's own frontend network traffic. There is no official API
   documentation, no auth, and no published stability guarantee — endpoints, field
