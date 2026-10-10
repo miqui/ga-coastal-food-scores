@@ -1,0 +1,198 @@
+import { eq } from 'drizzle-orm';
+import { facilities, inspections, violations, syncState } from '../db/schema.js';
+import type { AppDb } from '../db/client.js';
+import type { PortalClient, PortalFacilityRecord } from './portal-client.js';
+
+function stripLabel(value: string | undefined): string {
+  if (!value) return '';
+  const idx = value.indexOf(':');
+  return idx === -1 ? value.trim() : value.slice(idx + 1).trim();
+}
+
+function parsePortalDate(value: string): string {
+  const m = value.match(/(\d{2})-(\d{2})-(\d{4})/);
+  if (!m) return '';
+  const [, mm, dd, yyyy] = m;
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function parseFacilityRecord(county: string, raw: PortalFacilityRecord) {
+  const columns = raw.columns ?? {};
+  const addressLines = (raw.mapAddress ?? '').split('\n').map((l) => l.trim());
+  const city = (() => {
+    const last = addressLines[addressLines.length - 1] ?? '';
+    const m = last.match(/^([A-Za-z .'-]+),?\s*GA/i);
+    return m ? m[1].trim() : '';
+  })();
+  const lastScoreStr = stripLabel(columns['4']);
+  const lastScore = Number.parseInt(lastScoreStr, 10);
+  const lastDateRaw = stripLabel(columns['5']);
+  return {
+    id: raw.id,
+    name: raw.name,
+    address: raw.mapAddress ?? '',
+    city,
+    county,
+    permitType: stripLabel(columns['2']),
+    permitNumber: stripLabel(columns['3']),
+    phone: stripLabel(columns['1']),
+    lastInspectionScore: Number.isFinite(lastScore) ? lastScore : null,
+    lastInspectionDate: parsePortalDate(lastDateRaw),
+  };
+}
+
+export interface SyncResult {
+  county: string;
+  pagesWalked: number;
+  facilitiesSeen: number;
+  facilitiesUpserted: number;
+  facilitiesWithNewInspections: number;
+  inspectionsUpserted: number;
+  violationsUpserted: number;
+  newWatermark: string | null;
+}
+
+/**
+ * Walk a single county's paginated search results newest-inspection-first,
+ * upsert facility rows, and stop as soon as we see a page whose records are
+ * all at/below the stored watermark (nothing new left to find).
+ * Facilities whose last-inspection score/date changed (or are new) get their
+ * full inspection + violation history re-fetched.
+ */
+export async function syncCounty(
+  db: AppDb,
+  client: PortalClient,
+  county: string,
+  options: { maxPages?: number } = {},
+): Promise<SyncResult> {
+  const stateRow = db.select().from(syncState).where(eq(syncState.county, county)).get();
+  const watermark = stateRow?.watermark ?? null;
+
+  let page = 1;
+  let pagesWalked = 0;
+  let facilitiesSeen = 0;
+  let facilitiesUpserted = 0;
+  let facilitiesWithNewInspections = 0;
+  let inspectionsUpserted = 0;
+  let violationsUpserted = 0;
+  let newestDateSeen: string | null = null;
+  const maxPages = options.maxPages ?? 1000;
+
+  while (page <= maxPages) {
+    const records = await client.searchCounty(county, page);
+    if (records.length === 0) break;
+    pagesWalked += 1;
+
+    let allBelowWatermark = true;
+
+    for (const raw of records) {
+      facilitiesSeen += 1;
+      const parsed = parseFacilityRecord(county, raw);
+      if (!newestDateSeen || (parsed.lastInspectionDate && parsed.lastInspectionDate > newestDateSeen)) {
+        newestDateSeen = parsed.lastInspectionDate || newestDateSeen;
+      }
+
+      const isNewOrChanged =
+        !watermark || !parsed.lastInspectionDate || parsed.lastInspectionDate > watermark;
+      if (isNewOrChanged) {
+        allBelowWatermark = false;
+      }
+
+      const existing = db.select().from(facilities).where(eq(facilities.id, parsed.id)).get();
+      const scoreChanged =
+        !existing ||
+        existing.lastInspectionScore !== parsed.lastInspectionScore ||
+        existing.lastInspectionDate !== parsed.lastInspectionDate;
+
+      db.insert(facilities)
+        .values({ ...parsed, updatedAt: new Date().toISOString() })
+        .onConflictDoUpdate({
+          target: facilities.id,
+          set: { ...parsed, updatedAt: new Date().toISOString() },
+        })
+        .run();
+      facilitiesUpserted += 1;
+
+      if (scoreChanged) {
+        facilitiesWithNewInspections += 1;
+        const history = await client.getInspections(parsed.id);
+        for (const insp of history) {
+          const insertResult = db
+            .insert(inspections)
+            .values({
+              inspectionId: insp.inspectionId,
+              facilityId: parsed.id,
+              inspectionDate: insp.date,
+              purpose: insp.purpose,
+              score: insp.score,
+              inspector: insp.inspector,
+              reportUrl: insp.printablePath,
+            })
+            .onConflictDoUpdate({
+              target: inspections.inspectionId,
+              set: {
+                inspectionDate: insp.date,
+                purpose: insp.purpose,
+                score: insp.score,
+                inspector: insp.inspector,
+                reportUrl: insp.printablePath,
+              },
+            })
+            .run();
+          inspectionsUpserted += 1;
+
+          const inspectionRow = db
+            .select()
+            .from(inspections)
+            .where(eq(inspections.inspectionId, insp.inspectionId))
+            .get();
+          const localInspectionId = inspectionRow
+            ? inspectionRow.id
+            : Number(insertResult.lastInsertRowid);
+
+          // Replace violations for this inspection to avoid duplicate accumulation on re-sync.
+          db.delete(violations).where(eq(violations.inspectionId, localInspectionId)).run();
+          for (const v of insp.violations) {
+            db.insert(violations)
+              .values({
+                inspectionId: localInspectionId,
+                code: v.code,
+                ruleCitation: v.ruleCitation,
+                points: v.points,
+                correctedOnSite: v.correctedOnSite,
+                repeat: v.repeat,
+                notes: v.notes,
+              })
+              .run();
+            violationsUpserted += 1;
+          }
+        }
+      }
+    }
+
+    if (watermark && allBelowWatermark) {
+      break;
+    }
+    page += 1;
+  }
+
+  const newWatermark = newestDateSeen ?? watermark;
+  db.insert(syncState)
+    .values({ county, watermark: newWatermark, lastSyncedAt: new Date().toISOString() })
+    .onConflictDoUpdate({
+      target: syncState.county,
+      set: { watermark: newWatermark, lastSyncedAt: new Date().toISOString() },
+    })
+    .run();
+
+  return {
+    county,
+    pagesWalked,
+    facilitiesSeen,
+    facilitiesUpserted,
+    facilitiesWithNewInspections,
+    inspectionsUpserted,
+    violationsUpserted,
+    newWatermark,
+  };
+}
